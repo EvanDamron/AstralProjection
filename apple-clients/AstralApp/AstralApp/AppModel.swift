@@ -369,7 +369,19 @@ final class AppModel: NSObject {
         }
     }
     var pendingCanvas: [AstralComponent] = []
-    var turnActive = false
+    var turnActive = false {
+        didSet {
+            #if os(macOS)
+                // A turn no chat_message status will settle, such as a server-driven one, still gives its queue back.
+                if oldValue, !turnActive, !settlingChatTurnStatus,
+                    !localOperationSubmissions.values.contains(where: { $0.action == "chat_message" })
+                {
+                    settleAppQueue(
+                        completed: false, notice: "The task ended, so your queued follow-ups are back in the composer.")
+                }
+            #endif
+        }
+    }
     #if os(macOS)
         @ObservationIgnored var macWorkNotificationService = MacWorkNotificationService()
         @ObservationIgnored private var macTurnNotificationStartedAt: Date?
@@ -476,23 +488,25 @@ final class AppModel: NSObject {
         var sideQuestionAnswer: String?
         @ObservationIgnored private var sideQuestionRequestId: String?
         @ObservationIgnored private var composerReturnBindingStored: ComposerReturnBinding
+        @ObservationIgnored private var queuedFollowUpBeingEdited: String?
+        @ObservationIgnored private var appQueueSendWaiting = false
+        @ObservationIgnored private var settlingChatTurnStatus = false
+        @ObservationIgnored private var interruptsFromQueue: Set<String> = []
         struct QueueSnapshot: Equatable {
             let revision: Int
             var items: [QueuedFollowUpItem]
         }
         var turnSteerNegotiated: Bool { turnSteerAck != nil }
         var turnQueueCapable: Bool { turnSteerAck?.queueCapable ?? false }
-        var queuedFollowUps: [QueuedFollowUpItem] {
-            guard let chat = activeChatId, let snapshot = queueByChat[chat] else { return [] }
-            return snapshot.items
-        }
+        // A chat without an id yet keeps its app-side queue under the empty key until chat_created names it.
+        private var queueKey: String { activeChatId ?? "" }
+        var queuedFollowUps: [QueuedFollowUpItem] { queueByChat[queueKey]?.items ?? [] }
         var composerSteeringApplies: Bool {
             turnSteerNegotiated && turnActive && signedIn && connected && !mutationsLocked
                 && !timelineReadOnly && !waitingForEarlierTurn
         }
-        var composerQueueApplies: Bool {
-            turnQueueCapable && composerSteeringApplies
-        }
+        // Without a server queue the app holds queued follow-ups itself.
+        var composerQueueApplies: Bool { composerSteeringApplies }
         var composerReturnBinding: ComposerReturnBinding {
             get { composerReturnBindingStored }
             set {
@@ -769,7 +783,7 @@ final class AppModel: NSObject {
             {
                 composerReturnBindingStored = binding
             } else {
-                composerReturnBindingStored = .steer
+                composerReturnBindingStored = .queue
             }
         #endif
         let voiceDeviceKey = "astraldeep.voice.device-id.v1"
@@ -2565,10 +2579,16 @@ final class AppModel: NSObject {
             projects.negotiate(accepted)
             macComputerHost.workspaceNegotiated(projects: accepted)
             if accepted, connected { Task { await projects.refresh() } }
-            turnSteerAck = TurnSteerAcknowledgement.fromRoteConfig(frame.payload)
-            if !turnSteerNegotiated {
+            let nextAck = TurnSteerAcknowledgement.fromRoteConfig(frame.payload)
+            if nextAck == nil || nextAck?.queueCapable != turnSteerAck?.queueCapable {
+                // A queue held in one mode cannot be carried into the other without losing or doubling it.
+                restoreAppQueue(nil)
                 queueByChat.removeAll()
+            }
+            turnSteerAck = nextAck
+            if !turnSteerNegotiated {
                 pendingSteerTexts.removeAll()
+                interruptsFromQueue.removeAll()
             }
         #endif
         viewportSnapshotSupported = frame.payload["viewport_snapshot_supported"]?.boolValue == true
@@ -2884,6 +2904,9 @@ final class AppModel: NSObject {
             retireOrdinarySurfaceRequests(preservingReadIntent: true)
             voice.controlTransportDisconnected()
             clearPendingOperationSubmissions()
+            #if os(macOS)
+                restoreAppQueue("The connection dropped, so your queued follow-ups are back in the composer.")
+            #endif
             if turnActive {
                 restoreUnsettledChatSend(
                     "The connection dropped before this message finished. Review it and send it again.")
@@ -3372,14 +3395,28 @@ final class AppModel: NSObject {
                 nothingSaved = true
             }
             let failure = status.error.objectValue?["message"]?.stringValue
+            #if os(macOS)
+                if ownsActiveChatTurn, status.state != "completed" {
+                    restoreAppQueue("The task did not finish, so your queued follow-ups are back in the composer.")
+                }
+            #endif
             let restored =
                 ownsActiveChatTurn && nothingSaved && ["failed", "retryable"].contains(status.state)
                 && restoreFailedChatSend(requestGeneration: status.requestGeneration, failure: failure)
             clearLocalOperationSubmission(requestGeneration: status.requestGeneration)
             if ownsActiveChatTurn {
+                #if os(macOS)
+                    settlingChatTurnStatus = true
+                #endif
                 settleActiveChatTurn(
                     requestGeneration: status.requestGeneration,
                     discardUncommitted: status.state != "completed")
+                #if os(macOS)
+                    settlingChatTurnStatus = false
+                    settleAppQueue(
+                        completed: status.state == "completed",
+                        notice: "The task did not finish, so your queued follow-ups are back in the composer.")
+                #endif
             }
             if !restored, let message = failure {
                 bannerIsError = true
@@ -3858,6 +3895,12 @@ final class AppModel: NSObject {
             _ = conversationResumeStore.save(chatId: chatId, for: account)
         }
         adoptUnsentMessage(chatId: chatId)
+        #if os(macOS)
+            if activeChatId == nil, let unnamed = queueByChat.removeValue(forKey: "") {
+                queueByChat[chatId] = QueueSnapshot(
+                    revision: 0, items: (queueByChat[chatId]?.items ?? []) + unnamed.items)
+            }
+        #endif
         if activeChatId == nil, let pending = activityLog.removeValue(forKey: activityKey(nil)) {
             activityLog[chatId] = Array(((activityLog[chatId] ?? []) + pending).suffix(Self.maximumActivityRows))
             touchActivityChat(chatId)
@@ -4425,12 +4468,7 @@ final class AppModel: NSObject {
             }
             switch composerReturnBinding {
             case .steer: sendSteer(text)
-            case .queue:
-                if turnQueueCapable {
-                    queueFollowUp(text)
-                } else {
-                    sendSteer(text)
-                }
+            case .queue: queueFollowUp(text)
             }
         }
 
@@ -4458,15 +4496,53 @@ final class AppModel: NSObject {
         }
 
         func queueFollowUp(_ text: String) {
-            guard composerQueueApplies, let frame = TurnSteerOutbound.chatQueuePut(text, sessionId: activeChatId)
-            else { return }
+            guard composerQueueApplies else { return }
             steerNotice = nil
             queueConflictNotice = nil
-            rawSend(frame)
+            if turnQueueCapable {
+                if let frame = TurnSteerOutbound.chatQueuePut(text, sessionId: activeChatId) { rawSend(frame) }
+                return
+            }
+            var snapshot = queueByChat[queueKey] ?? QueueSnapshot(revision: 0, items: [])
+            guard snapshot.items.count < QueuedFollowUpItem.maximumItems else {
+                composerDraft = joinedWithDraft(text)
+                steerNotice = "Up to \(QueuedFollowUpItem.maximumItems) follow-ups can wait at once."
+                return
+            }
+            guard let item = appQueueItem(id: UUID().uuidString.lowercased(), text: text, revision: 1) else {
+                composerDraft = joinedWithDraft(text)
+                steerNotice = "A follow-up can be at most 20,000 characters, so this one is still in the composer."
+                return
+            }
+            snapshot.items.append(item)
+            queueByChat[queueKey] = snapshot
+        }
+
+        private func appQueueItem(id: String, text: String, revision: Int) -> QueuedFollowUpItem? {
+            let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return QueuedFollowUpItem(
+                json: .object([
+                    "queue_id": .string(id), "message": .string(message), "revision": .number(Double(revision)),
+                ]))
         }
 
         func editQueuedFollowUp(_ item: QueuedFollowUpItem, text: String) {
-            guard turnQueueCapable,
+            guard turnQueueCapable else {
+                if var snapshot = queueByChat[queueKey],
+                    let index = snapshot.items.firstIndex(where: { $0.id == item.id })
+                {
+                    if let edited = appQueueItem(id: item.id, text: text, revision: item.revision + 1) {
+                        snapshot.items[index] = edited
+                        queueByChat[queueKey] = snapshot
+                    } else if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        removeQueuedFollowUp(item)
+                    } else {
+                        steerNotice = "A follow-up can be at most 20,000 characters, so the edit was not saved."
+                    }
+                }
+                return
+            }
+            guard
                 let frame = TurnSteerOutbound.chatQueueEdit(
                     text, queueId: item.id, expectedRevision: item.revision, sessionId: activeChatId)
             else { return }
@@ -4474,9 +4550,72 @@ final class AppModel: NSObject {
             rawSend(frame)
         }
 
+        // The chip view reports edits so a finished answer never sends text that is still being changed.
+        func beginEditingQueuedFollowUp(_ item: QueuedFollowUpItem) {
+            queuedFollowUpBeingEdited = item.id
+        }
+
+        func endEditingQueuedFollowUp() {
+            queuedFollowUpBeingEdited = nil
+            if appQueueSendWaiting { settleAppQueue(completed: true, notice: nil) }
+        }
+
+        func interruptWithQueuedFollowUp(_ item: QueuedFollowUpItem) {
+            guard composerSteeringApplies, queuedFollowUps.contains(where: { $0.id == item.id }) else { return }
+            removeQueuedFollowUp(item)
+            sendSteer(item.message)
+            if let id = pendingSteerTexts.first(where: { $0.value == item.message })?.key {
+                interruptsFromQueue.insert(id)
+            }
+        }
+
+        // A completed answer sends the next app-side follow-up; any other ending gives the queue back.
+        private func settleAppQueue(completed: Bool, notice: String?) {
+            guard !turnQueueCapable, let items = queueByChat[queueKey]?.items, !items.isEmpty,
+                connected, !turnActive, !waitingForEarlierTurn
+            else { return }
+            guard completed, turnSteerNegotiated else {
+                restoreAppQueue(notice)
+                return
+            }
+            if items.first?.id == queuedFollowUpBeingEdited {
+                appQueueSendWaiting = true
+                return
+            }
+            // The composer's send path would also write the draft or take its files, so those cases hand the queue back.
+            if timelineReadOnly || mandatorySurface || projects.negotiating
+                || (projects.enabled && activeChatId.flatMap({ projects.project(for: $0) }) == nil)
+            {
+                restoreAppQueue("Your queued follow-ups could not be sent here, so they are back in the composer.")
+                return
+            }
+            appQueueSendWaiting = false
+            let next = items[0]
+            queueByChat[queueKey] = items.count > 1 ? QueueSnapshot(revision: 0, items: Array(items.dropFirst())) : nil
+            let draftFiles = staged
+            let draftBackground = runInBackground
+            staged = []
+            runInBackground = false
+            sendChat(next.message)
+            staged = draftFiles
+            runInBackground = draftBackground
+        }
+
+        private func restoreAppQueue(_ notice: String?) {
+            guard !turnQueueCapable, let items = queueByChat.removeValue(forKey: queueKey)?.items, !items.isEmpty
+            else { return }
+            appQueueSendWaiting = false
+            composerDraft = joinedWithDraft(items.map(\.message).joined(separator: "\n\n"))
+            if let notice { steerNotice = notice }
+        }
+
         func removeQueuedFollowUp(_ item: QueuedFollowUpItem) {
-            guard let chat = activeChatId else { return }
+            let chat = queueKey
             queueByChat[chat]?.items.removeAll { $0.id == item.id }
+            if queueByChat[chat]?.items.isEmpty == true, !turnQueueCapable { queueByChat[chat] = nil }
+            if !turnQueueCapable, appQueueSendWaiting, queuedFollowUpBeingEdited == item.id {
+                endEditingQueuedFollowUp()
+            }
             guard turnQueueCapable,
                 let frame = TurnSteerOutbound.chatQueueRemove(queueId: item.id, sessionId: activeChatId)
             else { return }
@@ -4484,7 +4623,8 @@ final class AppModel: NSObject {
         }
 
         func moveQueuedFollowUp(_ item: QueuedFollowUpItem, before: QueuedFollowUpItem?) {
-            guard let chat = activeChatId, var snapshot = queueByChat[chat],
+            let chat = queueKey
+            guard var snapshot = queueByChat[chat],
                 snapshot.items.contains(where: { $0.id == item.id })
             else { return }
             snapshot.items.removeAll { $0.id == item.id }
@@ -4545,9 +4685,19 @@ final class AppModel: NSObject {
             case "chat_steer_refused":
                 guard let refused = ChatSteerRefused(frame: frame) else { return }
                 let text = pendingSteerTexts.removeValue(forKey: refused.clientMessageId)
+                let fromQueue = interruptsFromQueue.remove(refused.clientMessageId) != nil
                 transientTurns.removeAll { $0.id == "pending-steer-\(refused.clientMessageId)" }
+                if let text, fromQueue, refused.code == .staleTurn, turnActive, !turnQueueCapable,
+                    let item = appQueueItem(id: UUID().uuidString.lowercased(), text: text, revision: 1)
+                {
+                    // The task moved on before the Interrupt applied, so it goes out next instead of being overtaken.
+                    queueByChat[queueKey] = QueueSnapshot(
+                        revision: 0, items: [item] + (queueByChat[queueKey]?.items ?? []))
+                    steerNotice = "The task moved on before your interruption applied, so it will be sent next."
+                    return
+                }
                 if let text {
-                    composerDraft = text
+                    composerDraft = joinedWithDraft(text)
                 }
                 steerNotice = steerRefusalNotice(refused)
             case "chat_queue_updated":
@@ -5696,6 +5846,8 @@ final class AppModel: NSObject {
             turnEditor = nil
             pendingTurnDeparture = nil
             queueByChat.removeAll()
+            queuedFollowUpBeingEdited = nil
+            appQueueSendWaiting = false
             pendingSteerTexts.removeAll()
             steerNotice = nil
             queueConflictNotice = nil
@@ -7411,8 +7563,16 @@ final class AppModel: NSObject {
             _ = conversationResumeStore.clear(.newChat, for: account)
         }
         seqState.removeAll()
+        #if os(macOS)
+            let keptQueues = turnQueueCapable ? [:] : queueByChat.filter { !$0.key.isEmpty }
+            let clearedUnsaved = !turnQueueCapable && !(queueByChat[""]?.items.isEmpty ?? true)
+        #endif
         clearContinuityChatKeepingConnection()
         resetChatState()
+        #if os(macOS)
+            queueByChat = keptQueues
+            if clearedUnsaved { steerNotice = "Queued follow-ups were cleared for the new chat." }
+        #endif
         screen = .chat
         sendEvent("new_chat")
     }
@@ -7464,6 +7624,13 @@ final class AppModel: NSObject {
         }
         screen = .chat
         viewingIndex = nil
+        #if os(macOS)
+            settleAppQueue(
+                completed: false,
+                notice:
+                    "The task finished while you were in another chat, so your queued follow-ups are back in the composer."
+            )
+        #endif
     }
 
     private func sendChatLoad(_ chatId: String, identity: ClientOperationIdentity) {
@@ -7486,6 +7653,10 @@ final class AppModel: NSObject {
 
     private func finishWaitingForEarlierTurn() {
         waitingForEarlierTurn = false
+        #if os(macOS)
+            settleAppQueue(
+                completed: false, notice: "The task ended, so your queued follow-ups are back in the composer.")
+        #endif
         guard let held = heldChatLoad else { return }
         heldChatLoad = nil
         if continuity.requestGeneration == held.identity.requestGeneration {

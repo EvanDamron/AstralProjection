@@ -1067,6 +1067,12 @@ struct InputBar: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Queued follow-ups")
                 .accessibilityIdentifier("composer-queue-chips")
+                .onDisappear {
+                    // An edit cut off by the view going away must not hold the queue.
+                    guard editingId != nil else { return }
+                    editingId = nil
+                    model.endEditingQueuedFollowUp()
+                }
             }
         }
 
@@ -1078,7 +1084,7 @@ struct InputBar: View {
                         .font(ConsoleTypography.caption)
                         .frame(minWidth: 160)
                         .onSubmit { commitEdit(item) }
-                        .onExitCommand { editingId = nil }
+                        .onExitCommand { cancelEdit() }
                         .accessibilityIdentifier("composer-queue-chip-editor")
                 } else {
                     Text(item.message)
@@ -1086,14 +1092,19 @@ struct InputBar: View {
                         .foregroundStyle(p.text)
                         .lineLimit(2)
                         .frame(maxWidth: 280, alignment: .leading)
-                        .onTapGesture {
-                            editingText = item.message
-                            editingId = item.id
-                        }
+                        .onTapGesture { beginEdit(item) }
+                    Button("Interrupt") { model.interruptWithQueuedFollowUp(item) }
+                        .buttonStyle(.plain)
+                        .font(ConsoleTypography.caption)
+                        .foregroundStyle(model.composerSteeringApplies ? p.primary : p.muted)
+                        .disabled(!model.composerSteeringApplies)
+                        .help("Send this now into the running task")
+                        .accessibilityLabel("Interrupt with follow-up")
+                        .accessibilityValue(item.message)
+                        .accessibilityIdentifier("composer-queue-chip-interrupt")
                 }
                 Button {
-                    editingText = item.message
-                    editingId = item.id
+                    beginEdit(item)
                 } label: {
                     Image(systemName: "pencil").font(.system(size: 11))
                 }
@@ -1122,12 +1133,26 @@ struct InputBar: View {
             .accessibilityIdentifier("composer-queue-chip")
         }
 
+        private func beginEdit(_ item: QueuedFollowUpItem) {
+            editingText = item.message
+            editingId = item.id
+            model.beginEditingQueuedFollowUp(item)
+        }
+
+        private func cancelEdit() {
+            editingId = nil
+            editingText = ""
+            model.endEditingQueuedFollowUp()
+        }
+
         private func commitEdit(_ item: QueuedFollowUpItem) {
             let text = editingText
             editingId = nil
             editingText = ""
-            guard text.trimmingCharacters(in: .whitespacesAndNewlines) != item.message else { return }
-            model.editQueuedFollowUp(item, text: text)
+            if text.trimmingCharacters(in: .whitespacesAndNewlines) != item.message {
+                model.editQueuedFollowUp(item, text: text)
+            }
+            model.endEditingQueuedFollowUp()
         }
     }
 
